@@ -333,5 +333,5 @@ def train_transformer(src_vocab_size: int,
 
     for param in transformer.parameters():
         if param.dim()>1:
-            nn.init.xavier_uniform_(p)
+            nn.init.xavier_uniform_(param)
     return transformer
