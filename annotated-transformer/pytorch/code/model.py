@@ -14,7 +14,7 @@ class InputEmbeddings(nn.Module):
         self.embedding = nn.Embedding(num_embeddings=vocab_size,
                                       embedding_dim=d_model)
 
-    # input is (batch_size, sequence_length)
+    # input is (batch_size, sequence_length) => (batch_size, sequence_length, embedding_dim)
     def forward(self, token_matrix: torch.Tensor):
         return self.embedding(token_matrix) * math.sqrt(self.d_model)
 
@@ -38,7 +38,8 @@ class PositionalEncoding(nn.Module):
             torch.arange(0, d_model, 2).float() *
             (-math.log(10000.0) / d_model))  # denominator in log space
 
-        # Apply the sine. to even positions
+        # Apply the sine. to even positions of encoding space
+        # apply the cos to odd positions of encoding space
         pe[:, 0::2] = torch.sin(position * div_term)  # step 0,2,4
         pe[:, 1::2] = torch.cos(position * div_term)  # step, 1,3,5
 
@@ -65,7 +66,7 @@ class LayerNorm(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1))  # multiplied
         self.bias = nn.Parameter(torch.ones(1))  #added
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         mean = x.mean(dim=-1, keepdim=True)
         std = x.std(dim=-1, keepdim=True)
         return self.alpha * (x - mean) / (std + self.eps) + self.bias
@@ -80,10 +81,10 @@ class FeedForward(nn.Module):
                  d_ff: int = 2048) -> None:
         super().__init__()
         self.linear_1 = nn.Linear(in_features=d_model, out_features=d_ff)
-        self.droput = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
         self.linear_2 = nn.Linear(in_features=d_ff, out_features=d_model)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         # (Batch, Seq_Len, d_model) --> (Batch, Seq_Len, d_ff) --> (Batch, Seq_Len, d_model)
         layer1_activation = self.linear_1(x)
         layer_2_x = torch.relu(layer1_activation)
@@ -104,39 +105,40 @@ class MultiHeadAttention(nn.Module):
         assert d_model % num_heads == 0, "d_model is not divisible by num_heads, decay cannot be obtained precisely"
 
         self.d_k = d_model // num_heads
-        self.w_q = nn.Linear(d_model, d_model)  # Wq
-        self.w_k = nn.Linear(d_model, d_model)  # Wq
-        self.w_v = nn.Linear(d_model, d_model)  # Wq
+        self.w_q = nn.Linear(in_features=d_model, out_features=d_model)  # Wq
+        self.w_k = nn.Linear(in_features=d_model, out_features=d_model)  # Wk
+        self.w_v = nn.Linear(in_features=d_model, out_features=d_model)  # Wv
 
-        self.w_o = nn.Linear(d_model, d_model)  #Wo
+        self.w_o = nn.Linear(in_features=d_model, out_features=d_model)  #Wo
         self.dropout = nn.Dropout(dropout)
 
     @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
+    def attention(query:torch.Tensor, key:torch.Tensor, value:torch.Tensor, mask:torch.Tensor, dropout: nn.Dropout):
         d_k = query.shape[-1]
 
-        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
+        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k) # (Batch, h, seq_len, seq_len) 
         if mask is not None:
             attention_scores.masked_fill(mask == 0, -1e9)
         attention_scores = attention_scores.softmax(
-            dim=-1)  # (Batch, h, seq_len, seq_len)
+            dim=-1)  # Softmax all attention scores for Q
         if dropout is not None:
             attention_scores = dropout(attention_scores)
         return (attention_scores @ value), attention_scores
 
     # Mask set during attention computation in decoder
-    def forward(self, q, k, v, mask):
+    def forward(self, q:torch.Tensor, k:torch.Tensor, v:torch.Tensor, mask:torch.Tensor):
         query = self.w_q(
             q
-        )  # (batch, max_seq_len, d_model) x (d_model, d_model) => (Batch, seq_len, d_model)
+        )  # (batch, seq_len, d_model) x (d_model, d_model) => (Batch, seq_len, d_model)
         key = self.w_k(
             k
-        )  # (batch, max_seq_len, d_model) x (d_model, d_model) => (Batch, seq_len, d_model)
+        )  # (batch, seq_len, d_model) x (d_model, d_model) => (Batch, seq_len, d_model)
         value = self.w_v(
             v
-        )  # (batch, max_seq_len, d_model) x (d_model, d_model) => (Batch, seq_len, d_model)
+        )  # (batch, seq_len, d_model) x (d_model, d_model) => (Batch, seq_len, d_model)
 
-        # (Batch, seq_len, d_model) => (Batch, seq_len, h, d_k) => (Batch, h, seq_len, d_k)
+        # (Batch, seq_len, d_model) => (Batch, seq_len, h, d_k) => (Batch, h, seq_len, d_k) 
+        # Transpose to facilitate parallelism across attention heads.
         query = query.view(query.shape[0], query.shape[1], self.num_heads,
                            self.d_k).transpose(1, 2)
 
@@ -150,11 +152,11 @@ class MultiHeadAttention(nn.Module):
 
         x, self.attention_scores = MultiHeadAttention.attention(
             query, key, value, mask, self.dropout)
-        # (Batch, h_seq, d_k) => (Batch, Seq_len, h, d_k) =>  (Batch, Seq_len, d_model)
+        # (Batch, h, seq_len, d_k) => (Batch, Seq_len, h, d_k) =>  (Batch, Seq_len, d_model)
         x = x.transpose(1, 2).contiguous().view(x.shape(0), -1,
                                                 self.h * self.d_k)
 
-        # (Batch, h, Seq_Len, d_model) ==> (Batch, Seq_Len, d_model)
+        # (Batch, Seq_len, d_model)
         return self.w_o(x)
 
 
@@ -165,7 +167,8 @@ class ResidualConnection(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm = LayerNorm()
 
-    def forward(self, x, sublayer):
+    # pre-normalization approach for greater stability, original paper uses post-normalization
+    def forward(self, x:torch.Tensor, sublayer:nn.Module):
         return x + self.dropout(sublayer(self.norm(x)))
 
 
@@ -179,8 +182,9 @@ class EncoderBlock(nn.Module):
         self.residual_connection = nn.ModuleList(
             [ResidualConnection(dropout=dropout) for _ in range(2)])
 
-    def forward(self, x, src_mask):
+    def forward(self, x:torch.Tensor, src_mask:torch.Tensor):
         x = self.residual_connection[0](
+            #                                       q,k,v
             x, lambda x: self.self_attention_block(x, x, x, src_mask))
         x = self.residual_connection[1](x, self.feed_forward_block)
         return x
@@ -332,6 +336,6 @@ def train_transformer(src_vocab_size: int,
                               proj=proj)
 
     for param in transformer.parameters():
-        if param.dim()>1:
+        if param.dim() > 1:
             nn.init.xavier_uniform_(param)
     return transformer
